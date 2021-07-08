@@ -1,6 +1,16 @@
-// Copyright 2016 Apcera Inc. All rights reserved.
+// Copyright 2016-2021 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-// Package stan is a Go client for the NATS Streaming messaging system (https://nats.io).
 package stan
 
 import (
@@ -8,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/go-nats-streaming/pb"
-	"github.com/nats-io/nats"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/stan.go/pb"
 )
 
 const (
@@ -28,9 +38,56 @@ type Msg struct {
 // Subscriptions and Options
 
 // Subscription represents a subscription within the NATS Streaming cluster. Subscriptions
-// will be rate matched and follow at-least delivery semantics.
+// will be rate matched and follow at-least once delivery semantics.
+// The subscription is safe to use in multiple Go routines concurrently.
 type Subscription interface {
+	// Unsubscribe removes interest in the subscription.
+	// For durables, it means that the durable interest is also removed from
+	// the server. Restarting a durable with the same name will not resume
+	// the subscription, it will be considered a new one.
 	Unsubscribe() error
+
+	// Close removes this subscriber from the server, but unlike Unsubscribe(),
+	// the durable interest is not removed. If the client has connected to a server
+	// for which this feature is not available, Close() will return a ErrNoServerSupport
+	// error.
+	Close() error
+
+	// These functions have been added for expert-users that need to get details
+	// about the low level NATS Subscription used internally to receive messages
+	// for this streaming subscription. They are documented in the Go client
+	// library: https://godoc.org/github.com/nats-io/nats.go#Subscription.ClearMaxPending
+
+	// ClearMaxPending resets the maximums seen so far.
+	ClearMaxPending() error
+
+	// Delivered returns the number of delivered messages for the internal low-level NATS subscription.
+	Delivered() (int64, error)
+
+	// Dropped returns the number of known dropped messages for the internal low-level NATS subscription.
+	// This will correspond to messages dropped by violations of PendingLimits. If the server declares
+	// the connection a SlowConsumer, this number may not be valid.
+	Dropped() (int, error)
+
+	// IsValid returns a boolean indicating whether the internal low-level NATS subscription is still active.
+	// This will return false if the subscription has already been closed.
+	IsValid() bool
+
+	// MaxPending returns the maximum number of queued messages and queued bytes seen so far for the internal
+	// low-level NATS subscription.
+	MaxPending() (int, int, error)
+
+	// Pending returns the number of queued messages and queued bytes in the client for the internal
+	// low-level NATS subscription.
+	Pending() (int, int, error)
+
+	// PendingLimits returns the current limits for the internal low-level NATS subscription. If no error is
+	// returned, a negative value indicates that the given metric is not limited.
+	PendingLimits() (int, int, error)
+
+	// SetPendingLimits sets the limits for pending msgs and bytes for the internal low-level NATS Subscription.
+	// Zero is not allowed. Any negative value means that the given metric is not limited.
+	SetPendingLimits(msgLimit, bytesLimit int) error
 }
 
 // A subscription represents a subscription to a stan cluster.
@@ -154,7 +211,7 @@ func SetManualAckMode() SubscriptionOption {
 	}
 }
 
-// DurableName sets the DurableName for the subcriber.
+// DurableName sets the DurableName for the subscriber.
 func DurableName(name string) SubscriptionOption {
 	return func(o *SubscriptionOptions) error {
 		o.DurableName = name
@@ -181,25 +238,27 @@ func (sc *conn) subscribe(subject, qgroup string, cb MsgHandler, options ...Subs
 		}
 	}
 	sc.Lock()
-	if sc.nc == nil {
+	if sc.closed {
 		sc.Unlock()
 		return nil, ErrConnectionClosed
 	}
 
 	// Register subscription.
 	sc.subMap[sub.inbox] = sub
-	nc := sc.nc
 	sc.Unlock()
 
 	// Hold lock throughout.
 	sub.Lock()
 	defer sub.Unlock()
 
+	// sc.nc is immutable and never nil once connection is created.
+
 	// Listen for actual messages.
-	nsub, err := nc.Subscribe(sub.inbox, sc.processMsg)
+	nsub, err := sc.nc.Subscribe(sub.inbox, sc.processMsg)
 	if err != nil {
 		return nil, err
 	}
+	nsub.SetPendingLimits(-1, -1)
 	sub.inboxSub = nsub
 
 	// Create a subscription request
@@ -224,9 +283,29 @@ func (sc *conn) subscribe(subject, qgroup string, cb MsgHandler, options ...Subs
 	}
 
 	b, _ := sr.Marshal()
-	reply, err := sc.nc.Request(sc.subRequests, b, 2*time.Second)
+	reply, err := sc.nc.Request(sc.subRequests, b, sc.opts.ConnectTimeout)
 	if err != nil {
 		sub.inboxSub.Unsubscribe()
+		if err == nats.ErrTimeout {
+			// On timeout, we don't know if the server got the request or
+			// not. So we will do best effort and send a "subscription close"
+			// request. However, since we don't have the AckInbox that is
+			// normally used to close a subscription, we will use the sub's
+			// inbox. Newer servers will fallback to lookup by inbox if they
+			// don't find the sub from the "AckInbox" lookup.
+			scr := &pb.UnsubscribeRequest{
+				ClientID: sc.clientID,
+				Subject:  subject,
+				Inbox:    sub.inbox,
+			}
+			b, _ := scr.Marshal()
+			// Send to the subscription close request, not the unsubscribe subject.
+			sc.nc.Publish(sc.subCloseRequests, b)
+		}
+		if err == nats.ErrTimeout || err == nats.ErrNoResponders {
+			// Report this error to the user.
+			err = ErrSubReqTimeout
+		}
 		return nil, err
 	}
 	r := &pb.SubscriptionResponse{}
@@ -243,11 +322,97 @@ func (sc *conn) subscribe(subject, qgroup string, cb MsgHandler, options ...Subs
 	return sub, nil
 }
 
-// Unsubscribe removes interest in the subscription
-func (sub *subscription) Unsubscribe() error {
-	if sub == nil {
+// ClearMaxPending resets the maximums seen so far.
+func (sub *subscription) ClearMaxPending() error {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
 		return ErrBadSubscription
 	}
+	return sub.inboxSub.ClearMaxPending()
+}
+
+// Delivered returns the number of delivered messages for this subscription.
+func (sub *subscription) Delivered() (int64, error) {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return -1, ErrBadSubscription
+	}
+	return sub.inboxSub.Delivered()
+}
+
+// Dropped returns the number of known dropped messages for this subscription.
+// This will correspond to messages dropped by violations of PendingLimits. If
+// the server declares the connection a SlowConsumer, this number may not be
+// valid.
+func (sub *subscription) Dropped() (int, error) {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return -1, ErrBadSubscription
+	}
+	return sub.inboxSub.Dropped()
+}
+
+// IsValid returns a boolean indicating whether the subscription
+// is still active. This will return false if the subscription has
+// already been closed.
+func (sub *subscription) IsValid() bool {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return false
+	}
+	return sub.inboxSub.IsValid()
+}
+
+// MaxPending returns the maximum number of queued messages and queued bytes seen so far.
+func (sub *subscription) MaxPending() (int, int, error) {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return -1, -1, ErrBadSubscription
+	}
+	return sub.inboxSub.MaxPending()
+}
+
+// Pending returns the number of queued messages and queued bytes in the client for this subscription.
+func (sub *subscription) Pending() (int, int, error) {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return -1, -1, ErrBadSubscription
+	}
+	return sub.inboxSub.Pending()
+}
+
+// PendingLimits returns the current limits for this subscription.
+// If no error is returned, a negative value indicates that the
+// given metric is not limited.
+func (sub *subscription) PendingLimits() (int, int, error) {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return -1, -1, ErrBadSubscription
+	}
+	return sub.inboxSub.PendingLimits()
+}
+
+// SetPendingLimits sets the limits for pending msgs and bytes for this subscription.
+// Zero is not allowed. Any negative value means that the given metric is not limited.
+func (sub *subscription) SetPendingLimits(msgLimit, bytesLimit int) error {
+	sub.Lock()
+	defer sub.Unlock()
+	if sub.inboxSub == nil {
+		return ErrBadSubscription
+	}
+	return sub.inboxSub.SetPendingLimits(msgLimit, bytesLimit)
+}
+
+// closeOrUnsubscribe performs either close or unsubsribe based on
+// given boolean.
+func (sub *subscription) closeOrUnsubscribe(doClose bool) error {
 	sub.Lock()
 	sc := sub.sc
 	if sc == nil {
@@ -258,38 +423,41 @@ func (sub *subscription) Unsubscribe() error {
 	sub.sc = nil
 	sub.inboxSub.Unsubscribe()
 	sub.inboxSub = nil
-	inbox := sub.inbox
 	sub.Unlock()
 
-	if sc == nil {
-		return ErrBadSubscription
-	}
-
 	sc.Lock()
-	if sc.nc == nil {
+	if sc.closed {
 		sc.Unlock()
 		return ErrConnectionClosed
 	}
 
-	delete(sc.subMap, inbox)
+	delete(sc.subMap, sub.inbox)
 	reqSubject := sc.unsubRequests
-	// Snapshot connection to avoid data race, since the connection may be
-	// closing while we try to send the request
-	nc := sc.nc
+	if doClose {
+		reqSubject = sc.subCloseRequests
+		if reqSubject == "" {
+			sc.Unlock()
+			return ErrNoServerSupport
+		}
+	}
 	sc.Unlock()
 
-	// Send Unsubscribe to server.
+	// sc.nc is immutable and never nil once connection is created.
 
-	// FIXME(dlc) - Add in durable?
 	usr := &pb.UnsubscribeRequest{
 		ClientID: sc.clientID,
 		Subject:  sub.subject,
 		Inbox:    sub.ackInbox,
 	}
 	b, _ := usr.Marshal()
-	// FIXME(dlc) - make timeout configurable.
-	reply, err := nc.Request(reqSubject, b, 2*time.Second)
+	reply, err := sc.nc.Request(reqSubject, b, sc.opts.ConnectTimeout)
 	if err != nil {
+		if err == nats.ErrTimeout || err == nats.ErrNoResponders {
+			if doClose {
+				return ErrCloseReqTimeout
+			}
+			return ErrUnsubReqTimeout
+		}
 		return err
 	}
 	r := &pb.SubscriptionResponse{}
@@ -303,18 +471,24 @@ func (sub *subscription) Unsubscribe() error {
 	return nil
 }
 
+// Unsubscribe implements the Subscription interface
+func (sub *subscription) Unsubscribe() error {
+	return sub.closeOrUnsubscribe(false)
+}
+
+// Close implements the Subscription interface
+func (sub *subscription) Close() error {
+	return sub.closeOrUnsubscribe(true)
+}
+
 // Ack manually acknowledges a message.
 // The subscriber had to be created with SetManualAckMode() option.
 func (msg *Msg) Ack() error {
 	if msg == nil {
 		return ErrNilMsg
 	}
-	// Look up subscription
+	// Look up subscription (cannot be nil)
 	sub := msg.Sub.(*subscription)
-	if sub == nil {
-		return ErrBadSubscription
-	}
-
 	sub.RLock()
 	ackSubject := sub.ackInbox
 	isManualAck := sub.opts.ManualAcks
@@ -322,22 +496,21 @@ func (msg *Msg) Ack() error {
 	sub.RUnlock()
 
 	// Check for error conditions.
-	if sc == nil {
-		return ErrBadSubscription
-	}
-	// Get nc from the connection (needs locking to avoid race)
-	sc.RLock()
-	nc := sc.nc
-	sc.RUnlock()
-	if nc == nil {
-		return ErrBadConnection
-	}
 	if !isManualAck {
 		return ErrManualAck
 	}
+	if sc == nil {
+		return ErrBadSubscription
+	}
+
+	// sc.nc is immutable and never nil once connection is created.
 
 	// Ack here.
 	ack := &pb.Ack{Subject: msg.Subject, Sequence: msg.Sequence}
 	b, _ := ack.Marshal()
-	return nc.Publish(ackSubject, b)
+	err := sc.nc.Publish(ackSubject, b)
+	if err == nats.ErrConnectionClosed {
+		return ErrBadConnection
+	}
+	return err
 }
